@@ -10,12 +10,22 @@ dotenv.config();
 const PORT = Number(process.env.PORT || 10000);
 const MAX_AUDIO_BYTES = Number(process.env.MAX_AUDIO_BYTES || 25_000_000);
 const SESSION_TIMEOUT_MS = Number(process.env.SESSION_TIMEOUT_MS || 90_000);
+const AUDIO_INPUT_FORMAT = process.env.AUDIO_INPUT_FORMAT || 'pcm_s16le';
+const AUDIO_SAMPLE_RATE = Number(process.env.AUDIO_SAMPLE_RATE || 16000);
+const AUDIO_CHANNELS = Number(process.env.AUDIO_CHANNELS || 1);
 const AUTH_ENABLED = process.env.BRIDGE_AUTH_ENABLED === 'true';
 
 const server = http.createServer((req, res) => {
-  if (req.url === '/health') {
+  const pathname = new URL(req.url || '/', 'http://localhost').pathname;
+  if (pathname === '/health') {
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, service: 'omi-cohere-stt-bridge' }));
+    res.end(JSON.stringify({
+      ok: true,
+      service: 'omi-cohere-stt-bridge',
+      audioInputFormat: AUDIO_INPUT_FORMAT,
+      sampleRate: AUDIO_SAMPLE_RATE,
+      channels: AUDIO_CHANNELS,
+    }));
     return;
   }
   res.writeHead(404);
@@ -29,7 +39,7 @@ server.on('upgrade', (req, socket, head) => {
     return;
   }
   if (AUTH_ENABLED && req.headers.authorization !== `Bearer ${process.env.BRIDGE_AUTH_TOKEN}`) {
-    socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+    socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
     socket.destroy();
     return;
   }
@@ -41,12 +51,12 @@ wss.on('connection', (ws) => {
   const chunks = [];
   let bytes = 0;
   let finalized = false;
-  let timer = setTimeout(() => finalize('timeout'), SESSION_TIMEOUT_MS);
-  console.info(`[${id}] connected`);
+  let timer = setTimeout(() => void finalize('timeout'), SESSION_TIMEOUT_MS);
+  console.info(`[${id}] connected format=${AUDIO_INPUT_FORMAT}`);
 
   const touch = () => {
     clearTimeout(timer);
-    timer = setTimeout(() => finalize('timeout'), SESSION_TIMEOUT_MS);
+    timer = setTimeout(() => void finalize('timeout'), SESSION_TIMEOUT_MS);
   };
 
   const finalize = async (reason) => {
@@ -54,19 +64,15 @@ wss.on('connection', (ws) => {
     finalized = true;
     clearTimeout(timer);
     try {
-      if (bytes === 0) {
-        await sendResult(ws, { segments: [] });
-      } else {
-        const audio = Buffer.concat(chunks);
-        const wav = await convertToWav(audio);
-        const result = await transcribe(wav);
-        await sendResult(ws, result);
-      }
+      const result = bytes === 0
+        ? { segments: [] }
+        : await transcribe(await convertToWav(Buffer.concat(chunks)));
+      await sendResult(ws, result);
     } catch (error) {
       console.error(`[${id}] ${reason} failed:`, error.message);
       await sendResult(ws, { segments: [], error: 'transcription_failed' });
     } finally {
-      if (ws.readyState === ws.OPEN) ws.close(1000, 'transcription complete');
+      if (ws.readyState === 1) ws.close(1000, 'transcription complete');
     }
   };
 
@@ -76,37 +82,57 @@ wss.on('connection', (ws) => {
       const chunk = Buffer.from(data);
       bytes += chunk.length;
       if (bytes > MAX_AUDIO_BYTES) {
-        finalize('size limit');
+        void finalize('size limit');
         return;
       }
       chunks.push(chunk);
       return;
     }
-    try {
-      const message = JSON.parse(data.toString());
-      if (message?.type === 'CloseStream') finalize('close stream');
-    } catch {
-      console.warn(`[${id}] ignored invalid control message`);
+
+    // Omi clients use {"type":"CloseStream"}; tolerate the plain string too.
+    const text = data.toString('utf8').trim();
+    let closeStream = text === 'CloseStream' || text === '"CloseStream"';
+    if (!closeStream) {
+      try {
+        const message = JSON.parse(text);
+        closeStream = message === 'CloseStream' || message?.type === 'CloseStream';
+      } catch {
+        console.warn(`[${id}] ignored text message: ${text}`);
+      }
     }
+    if (closeStream) void finalize('close stream');
   });
+
   ws.on('close', () => clearTimeout(timer));
   ws.on('error', (error) => console.warn(`[${id}] websocket error:`, error.message));
 });
 
-async function sendResult(ws, result) {
-  if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(result));
+function sendResult(ws, result) {
+  if (ws.readyState !== 1) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    ws.send(JSON.stringify(result), { binary: false }, (error) => error ? reject(error) : resolve());
+  });
 }
 
 async function convertToWav(input) {
-  const ffmpeg = spawn('ffmpeg', [
-    '-hide_banner', '-loglevel', 'error', '-f', 'opus', '-i', 'pipe:0',
-    '-ac', '1', '-ar', '16000', '-f', 'wav', 'pipe:1'
-  ]);
+  const args = ['-hide_banner', '-loglevel', 'error'];
+  if (AUDIO_INPUT_FORMAT === 'opus') {
+    args.push('-f', 'opus');
+  } else if (AUDIO_INPUT_FORMAT === 'pcm_s16le' || AUDIO_INPUT_FORMAT === 's16le') {
+    args.push('-f', 's16le', '-ar', String(AUDIO_SAMPLE_RATE), '-ac', String(AUDIO_CHANNELS));
+  } else {
+    throw new Error(`Unsupported AUDIO_INPUT_FORMAT: ${AUDIO_INPUT_FORMAT}`);
+  }
+  args.push('-i', 'pipe:0', '-ac', '1', '-ar', '16000', '-f', 'wav', 'pipe:1');
+
+  const ffmpeg = spawn('ffmpeg', args);
   const output = [];
+  const errors = [];
   ffmpeg.stdout.on('data', (chunk) => output.push(chunk));
+  ffmpeg.stderr.on('data', (chunk) => errors.push(chunk));
   ffmpeg.stdin.end(input);
   const [code] = await once(ffmpeg, 'close');
-  if (code !== 0) throw new Error('ffmpeg could not decode the Omi audio stream');
+  if (code !== 0) throw new Error(`ffmpeg failed: ${Buffer.concat(errors).toString().slice(0, 300)}`);
   return Buffer.concat(output);
 }
 
@@ -119,7 +145,7 @@ async function transcribe(wav) {
 
   const response = await fetch(
     process.env.COHERE_STT_ENDPOINT || 'https://api.cohere.com/v2/audio/transcriptions',
-    { method: 'POST', headers: { Authorization: `Bearer ${process.env.COHERE_API_KEY}` }, body: form }
+    { method: 'POST', headers: { Authorization: `Bearer ${process.env.COHERE_API_KEY}` }, body: form },
   );
   const body = await response.text();
   let payload;
@@ -133,7 +159,7 @@ async function transcribe(wav) {
         text: String(segment.text || segment.transcript || ''),
         speaker: segment.speaker || `SPEAKER_${String(index).padStart(2, '0')}`,
         start: Number(segment.start || 0),
-        end: Number(segment.end || 0)
+        end: Number(segment.end || 0),
       })).filter((segment) => segment.text)
     : text ? [{ text: String(text), speaker: 'SPEAKER_00', start: 0, end: 0 }] : [];
   return { segments };
