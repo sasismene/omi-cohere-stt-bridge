@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: omi-cohere-stt-bridge
+    env: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: COHERE_API_KEY
+        sync: false
+      - key: COHERE_STT_ENDPOINT
+        value: https://api.cohere.com/v2/audio/transcriptions
+      - key: COHERE_STT_MODEL
+        value: cohere-transcribe-03-2026
+      - key: COHERE_LANGUAGE
+        value: en
+      - key: BRIDGE_AUTH_ENABLED
+        value: "false"
+      - key: BRIDGE_AUTH_TOKEN
+        sync: false
