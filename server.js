@@ -109,8 +109,9 @@ wss.on('connection', (ws) => {
 
 function sendResult(ws, result) {
   if (ws.readyState !== 1) return Promise.resolve();
+  const payload = Buffer.from(JSON.stringify(result), 'utf8');
   return new Promise((resolve, reject) => {
-    ws.send(result, { binary: true }, (error) => error ? reject(error) : resolve());
+    ws.send(payload, { binary: true }, (error) => error ? reject(error) : resolve());
   });
 }
 
