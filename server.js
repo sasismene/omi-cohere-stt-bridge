@@ -110,7 +110,7 @@ wss.on('connection', (ws) => {
 function sendResult(ws, result) {
   if (ws.readyState !== 1) return Promise.resolve();
   return new Promise((resolve, reject) => {
-    ws.send(JSON.stringify(result), { binary: false }, (error) => error ? reject(error) : resolve());
+    ws.send(JSON.stringify(result), { binary: true }, (error) => error ? reject(error) : resolve());
   });
 }
 
